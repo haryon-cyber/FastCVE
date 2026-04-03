@@ -17,6 +17,7 @@ Copyright (c) 2020 to date, Binare Oy (license@binare.io) All rights reserved.
 
 import argparse
 import argcomplete
+import sys
 import time
 import pytz
 import re
@@ -27,8 +28,8 @@ from urllib3.util import Retry
 import generic
 from sqlalchemy import text, select, delete
 from sqlalchemy.dialects.postgresql import insert
-from datetime import datetime, timedelta
-from db.tables import FetchStatus, Vuln, VulnCpes, Cpe, Cwe, Capec, Epss
+from datetime import datetime, timedelta, timezone
+from db.tables import FetchStatus, Vuln, VulnCpes, Cpe, Cwe, Capec, Epss, VulnHistory
 import concurrent.futures
 import logging
 import json
@@ -48,6 +49,82 @@ http_retry_strategy = Retry(
     status_forcelist=[403, 503],
     allowed_methods=["GET"]
 )
+
+DEFAULT_FETCH_REQUEST_TIMEOUT = (10, 60)
+DEFAULT_FETCH_WORKER_TIMEOUT = 300
+NVD_RESUMABLE_DATA = {'cve', 'cpe', 'cvehist'}
+
+
+# ------------------------------------------------------------------------------
+def wait_for_worker_batch(workers, wait_timeout, worker_timeout, db_insert_progress, data_name, last_progress_time):
+    done, not_done = concurrent.futures.wait(
+        workers,
+        timeout=wait_timeout,
+        return_when=concurrent.futures.FIRST_COMPLETED,
+    )
+
+    if done:
+        return done, not_done, time.monotonic()
+
+    if not_done and time.monotonic() - last_progress_time >= worker_timeout:
+        raise ValidationError(
+            f'{data_name} processing timed out after {worker_timeout} seconds while waiting for DB workers to finish'
+        )
+
+    return done, not_done, last_progress_time
+
+
+# ------------------------------------------------------------------------------
+def serialize_fetch_datetime(value):
+    if value is None:
+        return None
+    return value.isoformat()
+
+
+# ------------------------------------------------------------------------------
+def parse_fetch_datetime(value):
+    if value is None:
+        return None
+    return datetime.fromisoformat(value)
+
+
+# ------------------------------------------------------------------------------
+def has_resume_overrides(args) -> bool:
+    return any((args.from_date, args.to_date, args.offset))
+
+
+# ------------------------------------------------------------------------------
+def get_resume_state(fetch_status_info):
+    if not fetch_status_info:
+        return None
+    stats = fetch_status_info.get('stats') or {}
+    if stats.get('complete', True):
+        return None
+    return stats.get('resume')
+
+
+# ------------------------------------------------------------------------------
+def build_fetch_status_payload(args, name, total_proc_records, complete, effective_from_date=None, effective_to_date=None, offset=None):
+    payload = dict(
+        to_date=effective_to_date if effective_to_date is not None else datetime.now(),
+        total_proc_records=total_proc_records,
+        complete=complete,
+        effective_args={
+            'data': name,
+            'from_date': serialize_fetch_datetime(effective_from_date),
+            'to_date': serialize_fetch_datetime(effective_to_date),
+            'offset': offset,
+        }
+    )
+
+    if not complete:
+        payload['resume'] = {
+            'from_date': serialize_fetch_datetime(effective_from_date),
+            'to_date': serialize_fetch_datetime(effective_to_date),
+            'offset': offset,
+        }
+
+    return payload
 
 # ------------------------------------------------------------------------------
 def generate_vuln_cpe(vuln_id, config, group_id, parent_group_id):
@@ -163,15 +240,68 @@ def save_cve_data(appctx, data) -> dict:
             db_records.append(cve_record)
 
     with appctx.db as session:
-        # First remove the existing records (if any)
-        for batch in [db_records[i:i + BATCH_SIZE] for i in range(0, len(data[key]), BATCH_SIZE)]:
-            session.execute(delete(Vuln).where(Vuln.vuln_id.in_([cve['vuln_id'] for cve in batch])))
-            session.bulk_insert_mappings(Vuln, batch, render_nulls=True)
+        for batch in [db_records[i:i + BATCH_SIZE] for i in range(0, len(db_records), BATCH_SIZE)]:
+            insert_cmd = insert(Vuln).values(batch)
+            insert_cmd = insert_cmd.on_conflict_do_update(
+                index_elements=['vuln_id'],
+                set_={
+                    'published_date': insert_cmd.excluded.published_date,
+                    'last_modified_date': insert_cmd.excluded.last_modified_date,
+                    'source': insert_cmd.excluded.source,
+                    'description': insert_cmd.excluded.description,
+                    'data': insert_cmd.excluded.data,
+                }
+            )
+            session.execute(insert_cmd)
 
         save_vuln_cpes_data(appctx, db_records_cpes)
 
     return {'index': data['startIndex'], 'total': data['totalResults'], 'processed': len(db_records)}
 
+
+# ------------------------------------------------------------------------------
+def save_cve_history_data(appctx, data) -> dict:
+
+    db_records = []
+
+    # Parse the "cveChanges" list
+    for item in data.get("cveChanges", []):
+        change = item.get("change", {})
+        if not change.get("cveChangeId"):
+            continue  # skip invalid entries
+
+        cve_record = dict(
+                vuln_id=change.get("cveId"),
+                change_id=change.get("cveChangeId"),
+                event_name=change.get("eventName"),
+                source=change.get("sourceIdentifier"),
+                change_date=datetime.strptime(change["created"], "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc) if change.get("created") else None,
+                data=change,
+            )
+        
+        db_records.append(cve_record)
+
+    if not db_records:
+        return {'index': data.get('startIndex', 0), 'total': data.get('totalResults', 0), 'processed': 0}
+
+    with appctx.db as session:
+        for batch in [db_records[i:i + BATCH_SIZE] for i in range(0, len(db_records), BATCH_SIZE)]:
+            insertCmd = insert(VulnHistory).values(batch)
+
+            insertCmd = insertCmd.on_conflict_do_update(
+                index_elements=['change_id'],
+                set_={
+                    "vuln_id": insertCmd.excluded.vuln_id,
+                    "event_name": insertCmd.excluded.event_name,
+                    "change_date": insertCmd.excluded.change_date,
+                    "source": insertCmd.excluded.source,
+                    "data": insertCmd.excluded.data,
+                }
+            )
+
+            session.execute(insertCmd)
+
+    return {'index': data.get('startIndex', 0), 'total': data.get('totalResults', 0), 'processed': len(db_records)}
 
 # ------------------------------------------------------------------------------
 def save_cpe_data(appctx, data) -> dict:
@@ -198,12 +328,29 @@ def save_cpe_data(appctx, data) -> dict:
             db_records.append(cpe_record)
 
     with appctx.db as session:
-        # First remove the existing records (if any)
-        for delete_batch in [data[key][i:i + BATCH_SIZE] for i in range(0, len(data[key]), BATCH_SIZE)]:
-            session.execute(delete(Cpe).where(Cpe.name.in_([cpe['cpe']['cpeName'] for cpe in delete_batch])))
-
-        for batch in [db_records[i:i + BATCH_SIZE] for i in range(0, len(data[key]), BATCH_SIZE)]:
-            session.bulk_insert_mappings(Cpe, batch, render_nulls=True)
+        for batch in [db_records[i:i + BATCH_SIZE] for i in range(0, len(db_records), BATCH_SIZE)]:
+            insert_cmd = insert(Cpe).values(batch)
+            insert_cmd = insert_cmd.on_conflict_do_update(
+                index_elements=['name'],
+                set_={
+                    'name_id': insert_cmd.excluded.name_id,
+                    'title_en': insert_cmd.excluded.title_en,
+                    'created': insert_cmd.excluded.created,
+                    'last_modified_date': insert_cmd.excluded.last_modified_date,
+                    'part': insert_cmd.excluded.part,
+                    'vendor': insert_cmd.excluded.vendor,
+                    'product': insert_cmd.excluded.product,
+                    'version': insert_cmd.excluded.version,
+                    'update': insert_cmd.excluded['update'],
+                    'edition': insert_cmd.excluded.edition,
+                    'language': insert_cmd.excluded.language,
+                    'sw_edition': insert_cmd.excluded.sw_edition,
+                    'target_sw': insert_cmd.excluded.target_sw,
+                    'target_hw': insert_cmd.excluded.target_hw,
+                    'data': insert_cmd.excluded.data,
+                }
+            )
+            session.execute(insert_cmd)
 
     return {'index': data['startIndex'], 'total': data['totalResults'], 'processed': len(db_records)}
 
@@ -242,7 +389,7 @@ def fetch_data_feed(appctx, data_name, args):
     try:
 
         rest_session.mount(data_url, HTTPAdapter(max_retries=http_retry_strategy))
-        response = rest_session.get(data_url, stream=True)
+        response = rest_session.get(data_url, stream=True, timeout=DEFAULT_FETCH_REQUEST_TIMEOUT)
         total_size = int(response.headers.get("content-length", 0))
 
         if response.status_code == 200:
@@ -260,23 +407,19 @@ def fetch_data_feed(appctx, data_name, args):
             fetch_progress.close()
 
         else:
-            # handle error
-            print(f"Request failed with status code {response.status_code} {response.text}")
-            return
+            raise ValidationError(f'Failed to fetch {data_name}: HTTP {response.status_code} {response.text}')
 
     except requests.exceptions.RequestException as e:
-        # handle error
-        print(f"Request failed: {e}")
-        return
+        raise ValidationError(f'Failed to fetch {data_name} after retries: {e}')
 
     # extract the content from the zip (load the xml)
     file_contents = []
     if content:
         if data_name == 'epss':
-            epss_response = requests.get(data_url, stream=True)
+            epss_response = rest_session.get(data_url, stream=True, timeout=DEFAULT_FETCH_REQUEST_TIMEOUT)
             epss_response.raise_for_status()
         elif data_name == 'kev':
-            response = rest_session.get(data_url)
+            response = rest_session.get(data_url, timeout=DEFAULT_FETCH_REQUEST_TIMEOUT)
             response.raise_for_status()
             data_json = response.json()
         else:
@@ -394,6 +537,11 @@ def fetch_data_feed(appctx, data_name, args):
     # Update the stats about retrieved information
     fetch_status(appctx, data_name, args, data=dict(to_date=data_date, total_proc_records=len(db_records)))
 
+    if data_name == 'epss':
+        synced = fetch_epss_data(appctx, update_db=True)
+        if synced == 0:
+            print("No CVE records loaded, skipped EPSS sync into CVE metrics")
+
 
 # ------------------------------------------------------------------------------
 def save_cwe_data(appctx, args, db_records):
@@ -486,8 +634,7 @@ def save_epss_data(appctx, args, epss_records):
             db_insert_progress.update(len(batch))
 
         db_insert_progress.close()
-        # here run it with no cve-ids
-        fetch_epss_data(appctx, update_db=True)
+    return len(epss_records)
 
 # ------------------------------------------------------------------------------
 def fetch_epss_data(appctx, update_db, CVE_IDS = None):
@@ -503,10 +650,15 @@ def fetch_epss_data(appctx, update_db, CVE_IDS = None):
         epss_query = session.scalars(stmt).all()
 
         if update_db:
+            if session.query(Vuln.id).limit(1).first() is None:
+                return 0
+
+            updated_count = 0
             # Process in batches.
             for batch in [epss_query[i:i + BATCH_SIZE] for i in range(0, len(epss_query), BATCH_SIZE)]:
                 # Extract the list of cve_ids from the current batch.
                 batch_ids = [epss.cve_id for epss in batch]
+                batch_rows = {epss.cve_id: epss for epss in batch}
                 # Select Vulnerability records with only the needed columns.
                 vuln_stmt = (
                     select(Vuln)
@@ -518,7 +670,7 @@ def fetch_epss_data(appctx, update_db, CVE_IDS = None):
 
                 for vuln_record in vuln_data:
                     # Find the corresponding epss record by cve_id
-                    epss_desired_row = next((row for row in batch if row.cve_id == vuln_record.vuln_id), None)
+                    epss_desired_row = batch_rows.get(vuln_record.vuln_id)
                     if epss_desired_row:
                         # Update the nested dictionary field
                         vuln_record.data['metrics']['epss'] = {
@@ -528,7 +680,10 @@ def fetch_epss_data(appctx, update_db, CVE_IDS = None):
                         }
                         update_values.append({'id': vuln_record.id, 'data': vuln_record.data})
                 # Bulk update mappings for the Vulnerabilities
-                session.bulk_update_mappings(Vuln, update_values)
+                if update_values:
+                    session.bulk_update_mappings(Vuln, update_values)
+                    updated_count += len(update_values)
+            return updated_count
         else:
             # Return a dictionary mapping cve_id to a list with the EPSs values
             return {
@@ -578,6 +733,8 @@ def fetch_data(appctx, data_name, args):
     # validate the data_name type to fetch
     if data_name == 'cve':
         method = save_cve_data
+    elif data_name == 'cvehist':
+        method = save_cve_history_data
     elif data_name == 'cpe':
         method = save_cpe_data
     elif data_name in ('cwe', 'capec', 'epss', 'kev'):
@@ -595,9 +752,6 @@ def fetch_data(appctx, data_name, args):
     if api_key: fetch_pause = appctx.config.get_param('fetch.request.pause.with_key', 1)
     else: fetch_pause = appctx.config.get_param('fetch.request.pause.without_key', 10)
 
-    data_index = 0
-    if args.offset: data_index = int(args.offset)
-
     # set the timezone as per the configuration to use for time adjustment
     timezone_cfg = appctx.config.get_param('fetch.timezone', 'UTC')
     timezone = None
@@ -610,6 +764,7 @@ def fetch_data(appctx, data_name, args):
     # ------------------------------------------------------------------
     # let's see if we need to populate the full DB or just part of it
     from_date = None
+    data_index = 0
     if args.to_date:
         if 'T' in args.to_date:
             to_date = datetime.strptime(args.to_date, "%Y-%m-%dT%H:%M:%S")
@@ -619,7 +774,21 @@ def fetch_data(appctx, data_name, args):
         to_date = datetime.now()
 
     prev_fetch_status = fetch_status(appctx, data_name, args)
-    if prev_fetch_status:
+    resume_state = None
+    if data_name in NVD_RESUMABLE_DATA and not has_resume_overrides(args):
+        resume_state = get_resume_state(prev_fetch_status)
+
+    if resume_state:
+        from_date = parse_fetch_datetime(resume_state.get('from_date'))
+        resume_to_date = parse_fetch_datetime(resume_state.get('to_date'))
+        if resume_to_date is not None:
+            to_date = resume_to_date
+        data_index = int(resume_state.get('offset', 0) or 0)
+    elif args.offset:
+        data_index = int(args.offset)
+        if prev_fetch_status and get_resume_state(prev_fetch_status) is None:
+            from_date = prev_fetch_status['last_modified_date']
+    elif prev_fetch_status and get_resume_state(prev_fetch_status) is None:
         from_date = prev_fetch_status['last_modified_date']
 
     from_date_args = None
@@ -629,8 +798,10 @@ def fetch_data(appctx, data_name, args):
         else:
             from_date_args = datetime.strptime(args.from_date, "%Y-%m-%d")
 
-    if not from_date and from_date_args:
-        raise ValidationError('from_date would be ignored as the DB is not populated or the sync data info is missing')
+    if resume_state:
+        pass
+    elif not from_date and from_date_args:
+        raise ValidationError('--from-date requires a prior successful fetch; the DB has no fetch status for this data type yet')
     elif from_date and from_date_args and from_date < from_date_args:
         raise ValidationError(f'specified from_date is bigger then the last update date <{from_date}> which can make "holes" in the vuln DB data')
     elif from_date_args:
@@ -639,7 +810,9 @@ def fetch_data(appctx, data_name, args):
     # ------------------------------------------------------------------
     # prepare the API query parameters
     rest_session = requests.Session()
+    worker_timeout = appctx.config.get_param('fetch.worker.timeout', DEFAULT_FETCH_WORKER_TIMEOUT)
     if api_key: rest_session.headers.update(apiKey=f'{api_key}')
+    rest_session.mount(url, HTTPAdapter(max_retries=http_retry_strategy))
 
     if from_date:
 
@@ -651,23 +824,34 @@ def fetch_data(appctx, data_name, args):
                   f'<{fetch_max_days_period}> days, thus setting the to_date to: {new_to_date}')
             to_date = new_to_date
 
-        rest_session.params.update(lastModStartDate=str(timezone.localize(from_date.replace(microsecond=0))).replace(' ', 'T'),
+        if data_name == 'cvehist':
+            rest_session.params.update(changeStartDate =str(timezone.localize(from_date.replace(microsecond=0))).replace(' ', 'T'),
+                      changeEndDate =str(timezone.localize(to_date.replace(microsecond=0))).replace(' ', 'T'))        
+        else:
+            rest_session.params.update(lastModStartDate=str(timezone.localize(from_date.replace(microsecond=0))).replace(' ', 'T'),
                       lastModEndDate=str(timezone.localize(to_date.replace(microsecond=0))).replace(' ', 'T'))
 
-        print(f'Starting {data_name} fetch from <{from_date}> till <{to_date}>')
+        if resume_state:
+            print(f'Resuming {data_name} fetch from <{from_date}> till <{to_date}> at offset <{data_index}>')
+        else:
+            print(f'Starting {data_name} fetch from <{from_date}> till <{to_date}>')
 
     else:
-        print(f'Starting {data_name} fetch')
+        if resume_state:
+            print(f'Resuming {data_name} fetch till <{to_date}> at offset <{data_index}>')
+        else:
+            print(f'Starting {data_name} fetch')
 
     # ------------------------------------------------------------------
     # init a thread pool of workers that would be used to process the data loaded in parallel
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
     workers = set()
+    worker_batches = {}
+    completed_batches = {}
 
     # ------------------------------------------------------------------
     # do the actual data retrieval
     success = True
-    total_proc_records = 0
 
     fetch_progress_name = f'{data_name} fetch'
     db_insert_progress_name = f'{data_name} db insert'
@@ -675,78 +859,127 @@ def fetch_data(appctx, data_name, args):
     fetch_progress = tqdm(total=None, bar_format=f'{fetch_progress_name:<20} {bar_format}', ascii=True)
     db_insert_progress = tqdm(total=None, bar_format=f'{db_insert_progress_name:<20} {bar_format}', ascii=True)
     fetch_progress.update(data_index)
+    last_worker_progress_time = time.monotonic()
+    resume_index = data_index
 
-    while fetch_ind:
-        rest_session.params.update(startIndex=data_index)
-        try:
-            rest_session.mount(url, HTTPAdapter(max_retries=http_retry_strategy))
-            response = rest_session.get(url)
-            if response.status_code == 200:
+    def record_completed_workers(done_workers):
+        nonlocal resume_index
+        for worker in done_workers:
+            result = worker.result()
+            db_insert_progress.update(result['processed'])
+            batch_start, batch_size = worker_batches.pop(worker)
+            completed_batches[batch_start] = result['processed'] or batch_size
 
-                data = response.json()
-                total_results, page_size = (data['totalResults'], data['resultsPerPage'])
-                workers.add(executor.submit(method, appctx, data))
-                if page_size > 0:
-                    if fetch_progress.total is None:
-                        fetch_progress.total = total_results
-                    if db_insert_progress.total is None:
-                        db_insert_progress.total = total_results - data_index
-                    fetch_progress.update(page_size)
-                    data_index += page_size
-                    total_proc_records += page_size
-                    if data_index < total_results:
-                        time.sleep(fetch_pause)
+        while resume_index in completed_batches:
+            resume_index += completed_batches.pop(resume_index)
+
+    try:
+        while fetch_ind:
+            rest_session.params.update(startIndex=data_index)
+            try:
+                response = rest_session.get(url, timeout=DEFAULT_FETCH_REQUEST_TIMEOUT)
+                if response.status_code == 200:
+
+                    data = response.json()
+                    total_results, page_size = (data['totalResults'], data['resultsPerPage'])
+                    batch_start = data_index
+                    worker = executor.submit(method, appctx, data)
+                    workers.add(worker)
+                    worker_batches[worker] = (batch_start, page_size)
+                    if page_size > 0:
+                        if fetch_progress.total is None:
+                            fetch_progress.total = total_results
+                        if db_insert_progress.total is None:
+                            db_insert_progress.total = total_results - data_index
+                        fetch_progress.update(page_size)
+                        data_index += page_size
+                        if data_index < total_results:
+                            time.sleep(fetch_pause)
+                        else:
+                            break
                     else:
                         break
+
+                    done_workers, workers, last_worker_progress_time = wait_for_worker_batch(
+                        workers,
+                        fetch_pause,
+                        worker_timeout,
+                        db_insert_progress,
+                        data_name,
+                        last_worker_progress_time,
+                    )
+                    if done_workers:
+                        record_completed_workers(done_workers)
                 else:
-                    break
+                    raise ValidationError(f'Failed to fetch {data_name}: HTTP {response.status_code} {response.text}')
 
-                done, not_done = concurrent.futures.wait(workers, timeout=fetch_pause, return_when=concurrent.futures.FIRST_COMPLETED)
-                for worker in done:
-                    db_insert_progress.update(worker.result()['processed'])
+            except requests.exceptions.RequestException as e:
+                raise ValidationError(f'Failed to fetch {data_name} after retries: {e}')
 
-                workers = not_done
-            else:
-                # handle error
-                print(f"Request failed with status code {response.status_code} {response.text}")
-                success = False
-                break
-
-        except requests.exceptions.RequestException as e:
-            # handle error
-            print(f"Request failed: {e}")
-            success = False
-            break
-
-    # wait for the rest of db saving tasks to finnish
-    while True:
-        done, not_done = concurrent.futures.wait(workers, timeout=fetch_pause, return_when=concurrent.futures.FIRST_COMPLETED)
-        for worker in done:
-            db_insert_progress.update(worker.result()['processed'])
-        if not not_done:
-            break
-        else:
-            workers = not_done
-
-    fetch_progress.close()
-    db_insert_progress.close()
-
-    executor.shutdown()
+        # wait for the rest of db saving tasks to finnish
+        while workers:
+            done_workers, workers, last_worker_progress_time = wait_for_worker_batch(
+                workers,
+                fetch_pause,
+                worker_timeout,
+                db_insert_progress,
+                data_name,
+                last_worker_progress_time,
+            )
+            if done_workers:
+                record_completed_workers(done_workers)
+    except ValidationError:
+        success = False
+        done_workers, _ = concurrent.futures.wait(workers, timeout=0, return_when=concurrent.futures.ALL_COMPLETED)
+        if done_workers:
+            record_completed_workers(done_workers)
+        if data_name in NVD_RESUMABLE_DATA and resume_index > 0:
+            fetch_status(
+                appctx,
+                data_name,
+                args,
+                data=build_fetch_status_payload(
+                    args,
+                    data_name,
+                    resume_index,
+                    complete=False,
+                    effective_from_date=from_date,
+                    effective_to_date=to_date,
+                    offset=resume_index,
+                )
+            )
+        raise
+    finally:
+        fetch_progress.close()
+        db_insert_progress.close()
+        executor.shutdown(wait=False)
 
     # time to save the details about what was done above
     if success:
-        fetch_status(appctx, data_name, args,
-                     data=dict(to_date=to_date, total_proc_records=total_proc_records))
+        fetch_status(
+            appctx,
+            data_name,
+            args,
+            data=build_fetch_status_payload(
+                args,
+                data_name,
+                resume_index,
+                complete=True,
+                effective_from_date=from_date,
+                effective_to_date=to_date,
+                offset=None,
+            )
+        )
 
 
 # ------------------------------------------------------------------------------
 def fetch_status(appctx, name, args, data=None):
     with appctx.db as session:
-
         # then we need to save/update the data in the fetch status table
         if data:
 
             if name == 'cve':      table_name = Vuln
+            elif name == 'cvehist':   table_name = VulnHistory
             elif name == 'cpe':    table_name = Cpe
             elif name == 'cwe':    table_name = Cwe
             elif name == 'capec':  table_name = Capec
@@ -768,10 +1001,14 @@ def fetch_status(appctx, name, args, data=None):
                         'to_date': args.to_date,
                         'offset': args.offset
                     },
+                    'effective_args': data.get('effective_args'),
+                    'complete': data.get('complete', True),
                     'processed_records': data['total_proc_records'],
                     'total_records': total_records
                 }
             }
+            if data.get('resume'):
+                stats[FetchStatus.stats.key]['resume'] = data['resume']
             upsert_qry = insert(FetchStatus).values(**stats)
             upsert_qry = upsert_qry.on_conflict_do_update(index_elements=[FetchStatus.name.key], set_=stats)
             session.execute(upsert_qry)
@@ -806,7 +1043,7 @@ def main():
     # --------------------------------------------------------------------------
     # Parse the arguments and Validate
     parser = argparse.ArgumentParser(description="FastCVE database Loader")
-    parser.add_argument('-d', '--data', dest='data', nargs='+', required=True, choices=['cpe', 'cve', 'cwe', 'capec', 'epss', 'kev'], help='Specify data to be loaded')
+    parser.add_argument('-d', '--data', dest='data', nargs='+', required=True, choices=['cpe', 'cve', 'cwe', 'capec', 'epss', 'kev', 'cvehist'], help='Specify data to be loaded')
     parser.add_argument('--full', dest='full', action='store_true', help='Will consider to fetch all data again')
     parser.add_argument('--drop', dest='drop', action='store_true', help='This will drop first existing data')
     parser.add_argument('-f', '--from', dest='from_date', action='store', help='From Date YYYY-MM-DD["T"HH:MI:SS]')
@@ -835,24 +1072,29 @@ def main():
 
     validate_opts(args_dict)
 
-    # Ensure 'epss' runs first, followed by 'cve' (if present), and 'kev' runs last (if present).
-    if 'cve' in args.data:
-        if 'epss' in args.data:
-            args.data.remove('cve')
-            args.data.append('cve')
-        elif 'kev' in args.data:
-            args.data.remove('kev')
-            args.data.append('kev')
+    try:
+        # Ensure 'epss' runs first, followed by 'cve' (if present), and 'kev' runs last (if present).
+        if 'cve' in args.data:
+            if 'epss' in args.data:
+                args.data.remove('cve')
+                args.data.append('cve')
+            elif 'kev' in args.data:
+                args.data.remove('kev')
+                args.data.append('kev')
 
-    # now we need to fetch the data from NVD/NIST/MITRE using the API and populate the DB
-    for data in args.data:
-        fetch_data(appctx, data, args)
+        # now we need to fetch the data from NVD/NIST/MITRE using the API and populate the DB
+        for data in args.data:
+            fetch_data(appctx, data, args)
+    except ValidationError as exc:
+        logger.error(str(exc))
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2)
 
     elapsed_time = time.time() - start_time
     logger.info(f'Finished loading data in {elapsed_time:.3f} seconds')
 
     if args.profile and profile:
-        profile_file = f'./load_profile_{datetime.utcnow().strftime("%Y%m%d_%H%M")}.prof'
+        profile_file = f'./load_profile_{datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")}.prof'
         profile.disable()
         profile.create_stats()
         profile.dump_stats(profile_file)
@@ -860,4 +1102,3 @@ def main():
 
 if __name__ == "__main__":
     result = main()
-

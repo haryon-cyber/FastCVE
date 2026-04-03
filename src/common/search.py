@@ -11,15 +11,27 @@ Copyright (c) 2020 to date, Binare Oy (license@binare.io) All rights reserved.
 
 import re
 import json
+from functools import lru_cache
 from typing import List, Iterator
 from sqlalchemy import Boolean,  cast, Numeric, select
 from sqlalchemy.sql import text, expression
 from sqlalchemy.orm import aliased
 from generic import ApplicationContext
-from db.tables import Vuln, VulnCpes, Cpe, Cwe, FetchStatus, Capec
+from db.tables import Vuln, VulnCpes, Cpe, Cwe, FetchStatus, Capec, VulnHistory
 from common.models import SearchOptions, SearchInfoType, OutputType, CPE23_REGEX_STR, metrics_mapping
+from datetime import datetime, time, timezone
 
 class ValidationError(Exception): ...
+class MissingSearchDataError(ValidationError): ...
+
+
+SEARCH_INFO_DATASETS = {
+    SearchInfoType.cve: dict(model=Vuln, label="CVE", load_arg="cve"),
+    SearchInfoType.cpe: dict(model=Cpe, label="CPE", load_arg="cpe"),
+    SearchInfoType.cwe: dict(model=Cwe, label="CWE", load_arg="cwe"),
+    SearchInfoType.capec: dict(model=Capec, label="CAPEC", load_arg="capec"),
+    SearchInfoType.cvehist: dict(model=VulnHistory, label="CVE history", load_arg="cvehist"),
+}
 
 # regex used to split the cpe 2.3 into separate pieces
 COLUMN_REGEX = re.compile(r'(?<!\\):')
@@ -28,6 +40,41 @@ CPE23_REGEX = re.compile(CPE23_REGEX_STR)
 # ------------------------------------------------------------------------------
 def get_non_empty_opts(opts: SearchOptions) -> dict:
     return {k: v for k, v in vars(opts).items() if v is not None}
+
+
+# ------------------------------------------------------------------------------
+def get_missing_search_data_message(search_info: SearchInfoType) -> str:
+
+    dataset = SEARCH_INFO_DATASETS[search_info]
+    return (
+        f"No {dataset['label']} data is loaded in the database for search-info={search_info.value}. "
+        f"Load it first with: load --data {dataset['load_arg']}"
+    )
+
+
+# ------------------------------------------------------------------------------
+def get_search_data_cache_bucket() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# ------------------------------------------------------------------------------
+@lru_cache(maxsize=len(SEARCH_INFO_DATASETS))
+def _ensure_search_data_loaded_cached(search_info: SearchInfoType, cache_bucket: str) -> SearchInfoType:
+
+    dataset = SEARCH_INFO_DATASETS.get(search_info)
+    if not dataset:
+        return search_info
+
+    with ApplicationContext.instance().db as session:
+        row = session.execute(select(dataset['model'].id).limit(1)).first()
+        if row is None:
+            raise MissingSearchDataError(get_missing_search_data_message(search_info))
+    return search_info
+
+
+# ------------------------------------------------------------------------------
+def ensure_search_data_loaded(appctx: ApplicationContext, search_info: SearchInfoType) -> None:
+    _ensure_search_data_loaded_cached(search_info, get_search_data_cache_bucket())
 
 
 # ------------------------------------------------------------------------------
@@ -135,6 +182,79 @@ def search_cves(appctx: ApplicationContext, opts: SearchOptions):
 
     return result
 
+# ------------------------------------------------------------------------------
+def search_cvehist(appctx: ApplicationContext, opts: SearchOptions):
+
+    result = {}
+    vh_table = aliased(VulnHistory, name='vh_table')
+
+    with appctx.db as session:
+
+        filters = []
+
+        # filter by CVE IDs
+        if opts.cveId:
+            cve_ids = list({cve_id.upper() for cve_id in opts.cveId})
+            filters.append(vh_table.vuln_id.in_(cve_ids))
+
+        # filter by change event name (regex, case-insensitive)
+        if opts.changeEvent:
+            filters.append(vh_table.event_name.op("~*")(opts.changeEvent))
+
+        # filter by change type inside details[].type (JSONB)
+        if opts.changeType:
+            filters.append(
+                text(
+                    "EXISTS ("
+                    "SELECT 1 "
+                    "FROM jsonb_array_elements(COALESCE(vh_table.data->'details', '[]'::jsonb)) AS detail "
+                    "WHERE detail->>'type' ~* :ct"
+                    ")"
+                ).bindparams(ct=opts.changeType)
+            )
+
+        # filter by change date range
+        if opts.lastModStartDate:
+            start_dt = datetime.combine(opts.lastModStartDate, time.min)
+            filters.append(vh_table.change_date >= start_dt)
+        if opts.lastModEndDate:
+            end_dt = datetime.combine(opts.lastModEndDate, time.max)
+            filters.append(vh_table.change_date <= end_dt)
+
+        filtered_history_query = select(
+            vh_table.vuln_id.label("vuln_id"),
+            vh_table.change_date.label("change_date"),
+            vh_table.data.label("data"),
+        )
+        if filters:
+            filtered_history_query = filtered_history_query.where(*filters)
+        filtered_history = filtered_history_query.cte("filtered_history").prefix_with("MATERIALIZED")
+
+        # 1) paginate matching CVE IDs from the filtered rowset
+        cve_id_subquery = (
+            select(filtered_history.c.vuln_id)
+            .distinct()
+            .order_by(filtered_history.c.vuln_id)
+            .offset(opts.pageIdx * opts.pageSize)
+            .limit(opts.pageSize)
+            .subquery()
+        )
+
+        # 2) return the matching history rows for those paginated CVEs
+        query = (
+            select(filtered_history.c.data)
+            .where(filtered_history.c.vuln_id.in_(select(cve_id_subquery.c.vuln_id)))
+            .order_by(filtered_history.c.vuln_id, filtered_history.c.change_date)
+        )
+
+        rows = session.execute(query).all()
+
+        result = {
+            "search": get_non_empty_opts(opts),
+            "result": [row.data for row in rows],
+        }
+
+    return result
 
 # ------------------------------------------------------------------------------
 def get_cvss_metric_conditions(cvss_metrics: str, version:str) -> Iterator[dict]:
@@ -426,6 +546,7 @@ def search_capec(appctx: ApplicationContext, opts: SearchOptions):
 def search_data(appctx, opts: SearchOptions):
 
     search_results = {}
+    ensure_search_data_loaded(appctx, opts.searchInfo)
 
     # search the data based on the input criterias
     if   opts.searchInfo == SearchInfoType.status:  search_results = get_fetch_status(appctx)
@@ -433,6 +554,7 @@ def search_data(appctx, opts: SearchOptions):
     elif opts.searchInfo == SearchInfoType.cpe:     search_results = search_cpes(appctx, opts)
     elif opts.searchInfo == SearchInfoType.cwe:     search_results = search_cwes(appctx, opts)
     elif opts.searchInfo == SearchInfoType.capec:   search_results = search_capec(appctx, opts)
+    elif opts.searchInfo == SearchInfoType.cvehist:        search_results = search_cvehist(appctx, opts)
 
     return search_results
 
@@ -453,6 +575,7 @@ def results_output_id(opts: SearchOptions, search_results):
         SearchInfoType.cpe:     'cpeName',
         SearchInfoType.cwe:     'ID',
         SearchInfoType.capec:   'ID',
+        SearchInfoType.cvehist: 'cveId',
     }
 
     key = key_names_map[opts.searchInfo]

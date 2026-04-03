@@ -147,17 +147,17 @@ Restore:
 docker compose exec -T fastcve-db sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists "/backup/fastcve_vuln_db_YYYY-MM-DD.dump"'
 ```
 
-- **Populate the DB for the first time (CVE/CPE/CWE/CAPEC/EPSS/KEV)**:
+- **Populate the DB for the first time (CVE/CVE history/CPE/CWE/CAPEC/EPSS/KEV)**:
 ```bash
-docker compose exec fastcve load --data cve cpe cwe capec epss kev
+docker compose exec fastcve load --data cve cvehist cpe cwe capec epss kev
 ```
 
-- **Update CVE/CPE incrementally (and refresh EPSS/KEV)**:
+- **Update CVE/CVE history/CPE incrementally (and refresh EPSS/KEV)**:
 ```bash
-docker compose exec fastcve load --data cve cpe epss kev
+docker compose exec fastcve load --data cve cvehist cpe epss kev
 ```
 
-This fetches changes since the last successful update (for CVE/CPE), with an upper limit of `fetch.max.days.period` (default 120 days) enforced by the loader.
+This fetches changes since the last successful update (for CVE/CVE history/CPE), with an upper limit of `fetch.max.days.period` (default 120 days) enforced by the loader.
 
 If there is a need to repopulate the DB for the CWE/CAPEC info, then `--full` and `--drop` options are available for the load command. `--full` ignores the fact the data is already present and `--drop` drops existing data before loading. When using `--data epss` in combination with `--epss-now`, the loader fetches EPSS data for the current date; otherwise it defaults to the previous day.
 
@@ -195,6 +195,14 @@ Additional filters are available for CVE search:
 --last-mod-start-date # retrieve only those CVEs that are last modified after the start date
 --last-mod-end-date   # retrieve only those CVEs that are last modified before the end date
 ```
+
+- search for the data: **get CVE history rows for a CVE or change pattern**
+```
+docker compose exec fastcve search --search-info cvehist --cve CVE-2024-3094 --change-event 'Initial Analysis' --output json
+```
+
+Above will return the matching CVE history change records. `cvehist` supports filtering by CVE ID, change date range, `--change-event`, and `--change-type`.
+
 - search for the data: **get the valid list of CPE names for a query on part/vendor/product/version etc**.
 
 ```
@@ -216,6 +224,7 @@ The following endpoints are exposed through HTTP requests
 ```
 /status - DB status
 /api/search/cve - search for CVE data
+/api/search/cvehist - search for CVE history data
 /api/search/cpe - search for CPE data
 /api/search/cwe - search for CWE data
 /api/search/capec - search for CAPEC data

@@ -159,3 +159,24 @@ class Epss(Base):
     percentile = Column(Float, nullable=False, comment=u"the percentile of the epss")
     date = Column(DateTime, nullable=False, comment=u"Date when the EPSS record has been downloaed")
     changed = Column(Boolean, comment=u'indicate if epss_score has been changed')
+
+# ------------------------------------------------------------------------------
+class VulnHistory(Base):
+    __tablename__ = "vuln_history"
+
+    id = Column(Integer, primary_key=True)
+    vuln_id = Column(String(20), index=True, nullable=False, comment=u'The cveID associated with the change')
+    change_id = Column(String(64), nullable=False, unique=True, index=True, comment=u'The change ID associated with the CVE')
+    event_name = Column(String(64), index=True, comment=u'The name of the event/change')
+    source = Column(String(100), comment=u'The source identifier for the change')
+    change_date = Column(DateTime(timezone=True), index=True, comment=u'The date the source was created')
+    data = Column(JSONB, nullable=False, comment=u'The full change object')
+    sys_creation_date = Column(DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_vuln_history_data_gin",
+            data,
+            postgresql_using="gin",
+        ),
+    )

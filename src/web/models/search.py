@@ -9,6 +9,7 @@ from typing import List, Optional
 from datetime import datetime, date
 from common.models.cve import CveItem
 from common.models.cpe import CpeItem
+from common.models.cve_history import CveHistoryItem
 from common.models import CveSeverityV2, CveSeverityV3, CveSeverityV4
 
 
@@ -16,6 +17,9 @@ class CveOutput(BaseModel):
     search: dict
     result: List[CveItem]
 
+class CveHistoryOutput(BaseModel):
+    search: dict
+    result: List[CveHistoryItem]
 
 class CpeOutput(BaseModel):
     search: dict
@@ -101,6 +105,23 @@ class SearchInputCve:
         self.exploitable = exploitable
         self.vulnerable = vulnerable
         self.days = days
+
+
+class SearchInputCveHistory:
+
+    def __init__(self, *,
+        cve_id: Optional[List[str]] = Query(default=None, description="Related CVE IDs to search for", alias="cve"),
+        change_start_date: Optional[date] = Query(default=None, description="CVE change start date", alias="change-start-date"),
+        change_end_date: Optional[date] = Query(default=None, description="CVE change end date", alias="change-end-date"),
+        change_event: Optional[str] = Query(default=None, description="CVE change event name (regex match)", alias="change-event"),
+        change_type: Optional[str] = Query(default=None, description="CVE change detail type (regex match)", alias="change-type"),
+    ) -> None:
+
+        self.cve_id = cve_id
+        self.change_start_date = change_start_date
+        self.change_end_date = change_end_date
+        self.change_event = change_event
+        self.change_type = change_type
 
 
 class SearchInputCpe:

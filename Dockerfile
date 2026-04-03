@@ -19,4 +19,4 @@ COPY ./src ${FCDB_HOME}
 
 EXPOSE 8000
 
-CMD ["uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["/bin/sh", "-c", "python -m web.prestart && exec uvicorn web.app:app ${FCDB_WEB_PARAMS:---host 0.0.0.0 --port 8000 --workers 4}"]

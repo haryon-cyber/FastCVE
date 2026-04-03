@@ -12,15 +12,16 @@ Copyright (c) 2020 to date, Binare Oy (license@binare.io) All rights reserved.
 """
 
 import os
+import sys
 import logging
 import pydantic_argparse
 import argcomplete
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from generic import ApplicationContext
 from common.models import SearchOptions
 from common.util import init_db_schema
-from common.search import search_data, results_output
+from common.search import search_data, results_output, ValidationError
 
 __version__ = os.getenv("APP_VERSION", "modified")
 __description__ = "FastCVE - fast, rich and API-based search for CVE and more (CPE, CWE, CAPEC)"
@@ -59,17 +60,22 @@ def main():
     init_db_schema()
 
     # search the data
-    result = search_data(appctx, args)
+    try:
+        result = search_data(appctx, args)
 
-    # print out the results
-    results_output(args, result)
+        # print out the results
+        results_output(args, result)
+    except ValidationError as exc:
+        logger.error(str(exc))
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2)
 
     # calculate the time needed for the search
     elapsed_time = time.time() - start_time
     logger.info(f"search time: {elapsed_time:.3f} seconds")
 
     if args.profile and profile:
-        profile_file = f'./search_profile_{datetime.utcnow().strftime("%Y%m%d_%H%M")}.prof'
+        profile_file = f'./search_profile_{datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")}.prof'
         profile.disable()
         profile.create_stats()
         profile.dump_stats(profile_file)

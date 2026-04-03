@@ -10,10 +10,12 @@ from generic.context import ApplicationContext
 from web.dependencies import get_app_cntxt
 from typing import Any
 from common.models import SearchInfoType, SearchOptions
-from common.search import search_data, ValidationError
+from common.search import search_data, ValidationError, MissingSearchDataError
 from web.models.search import (
     CveOutput, 
     CpeOutput, 
+    CveHistoryOutput,
+    SearchInputCveHistory,
     SearchInputCommon,
     SearchInputCve,
     SearchInputCpe,
@@ -32,6 +34,9 @@ def search(appctx: ApplicationContext, opts: SearchOptions) -> any:
 
     try:
         result = search_data(appctx, opts)
+    except MissingSearchDataError as exc:
+        logger.exception(exc)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except ValidationError as exc:
         logger.exception(exc)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
@@ -81,6 +86,35 @@ async def search_cve(cmn_opts: SearchInputCommon = Depends(SearchInputCommon),
         )
     except PydanticValidationError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+    return search(appctx, opts)
+
+
+# ------------------------------------------------------------------------------
+@router.get("/cvehist", name="Search CVE History", response_model=CveHistoryOutput, response_model_exclude_unset=True)
+async def search_cve_history(cmn_opts: SearchInputCommon = Depends(SearchInputCommon), 
+                             hist_opts: SearchInputCveHistory = Depends(SearchInputCveHistory),
+                             appctx: ApplicationContext = Depends(get_app_cntxt),
+    ) -> CveHistoryOutput:
+
+    """API to search for CVE change history"""
+
+    try:
+        opts = SearchOptions(
+            searchInfo=SearchInfoType.cvehist,
+            pageIdx=cmn_opts.page_idx,
+            pageSize=cmn_opts.page_size,
+            cveId=hist_opts.cve_id,
+            lastModStartDate=hist_opts.change_start_date,
+            lastModEndDate=hist_opts.change_end_date,
+            changeEvent=hist_opts.change_event,
+            changeType=hist_opts.change_type,
+        )
+    except PydanticValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc)
+        )
 
     return search(appctx, opts)
 

@@ -75,6 +75,8 @@ class SearchInfoType(str, Enum):
     cpe = "cpe"
     capec = "capec"
     status = "status"
+    cvehist = "cvehist"
+
 
 
 class CveSeverityV2(str, Enum):
@@ -129,6 +131,8 @@ class SearchOptions(BaseModel):
     lastModEndDate: Optional[date] = Field(default=None, description="Last modified end date", alias="last-mod-end-date")
     pubStartDate: Optional[date] = Field(default=None, description="CVE Published start date", alias="pub-start-date")
     pubEndDate: Optional[date] = Field(default=None, description="CVE Published start date", alias="pub-end-date")
+    changeEvent: Optional[str] = Field(default=None, description="Regexp to filter CVE history by change event name (e.g. 'CVE Modified', 'Initial Analysis')", cli=('--change-event',),alias="change-event")
+    changeType: Optional[str] = Field(default=None, description="Regexp to filter CVE history by change detail type (e.g. 'Reference', 'CVSS V3.1')", cli=('--change-type',), alias="change-type")
     vulnerable: Optional[bool] = Field(default=True, description="CVE found by the CPEs that are marked as vulnerable", alias="vulnerable")
     pageSize: Optional[int] = Field(description="Number of results per page", default=100, alias="page-size", ge=10, le=3000)
     pageIdx: Optional[int] = Field(default=0, description="Starting index", alias="page-idx", ge=0)
@@ -153,8 +157,8 @@ class SearchOptions(BaseModel):
     def validate_mandatory_fields(cls, inst):
         """Implement the root validator"""
 
-        # Validate input parameters in case of search-info set as CVE
-        if inst.get('searchInfo', None) in (SearchInfoType.cve, SearchInfoType.cpe):
+        # Validate input parameters in case of search-info set as CVE/CPE/CveHistory
+        if inst.get('searchInfo', None) in (SearchInfoType.cve, SearchInfoType.cpe, SearchInfoType.cvehist):
             if inst['lastModStartDate'] and inst['lastModEndDate'] and inst['lastModStartDate'] > inst['lastModEndDate']:
                 exc = ValueError('Last modified start date must be before last modified end date')
                 raise ValidationError([ErrorWrapper(exc, loc=cls.__fields__['lastModStartDate'].alias)], cls)

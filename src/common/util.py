@@ -6,6 +6,7 @@ Copyright (c) 2020 to date, Binare Oy (license@binare.io) All rights reserved.
 
 import os
 import shutil
+import time
 from alembic.config import Config
 from alembic import command
 
@@ -46,6 +47,26 @@ def init_db_schema():
                 connection.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
     finally:
         os.chdir(cwd)
+
+
+# ------------------------------------------------------------------------------
+def ensure_db_schema(max_attempts=60, retry_delay=1):
+
+    setup_env()
+
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            init_db_schema()
+            return
+        except Exception as exc:  # pragma: no cover
+            last_exc = exc
+            if attempt == max_attempts - 1:
+                break
+            time.sleep(retry_delay)
+
+    if last_exc is not None:  # pragma: no cover
+        raise last_exc
 
 
 # ------------------------------------------------------------------------------
