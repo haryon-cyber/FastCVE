@@ -8,10 +8,9 @@ cd "${SCRIPT_DIR}"
 
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/.env"
-# Load registry-specific overrides if present
-if [ -f "${SCRIPT_DIR}/.env.registry" ]; then
-  set -a; source "${SCRIPT_DIR}/.env.registry"; set +a
-fi
+
+# Save the local build tag before any registry override
+LOCAL_APP_IMAGE="${FASTCVE_DOCKER_IMG}:${FASTCVE_DOCKER_TAG}"
 
 SNAPSHOT_DIR=""
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
@@ -71,6 +70,11 @@ docker cp "${DB_CONTAINER}:/var/lib/postgresql/data/." "${SNAPSHOT_DIR}/pgdata"
 # Remove stale PID file if any (can happen if container stopped forcefully)
 rm -f "${SNAPSHOT_DIR}/pgdata/postmaster.pid"
 
+# Now load registry overrides for tagging (after compose steps are done)
+if [ -f "${SCRIPT_DIR}/.env.registry" ]; then
+  set -a; source "${SCRIPT_DIR}/.env.registry"; set +a
+fi
+
 # [5/6] Build the pre-populated DB image
 echo "=== [5/6] Building DB image ==="
 
@@ -85,9 +89,9 @@ docker build \
   -f "${SNAPSHOT_DIR}/Dockerfile" \
   "${SNAPSHOT_DIR}"
 
-# Tag the app image
-docker tag "${FASTCVE_DOCKER_IMG}:${FASTCVE_DOCKER_TAG}" "${APP_IMAGE}:${TAG}"
-docker tag "${FASTCVE_DOCKER_IMG}:${FASTCVE_DOCKER_TAG}" "${APP_IMAGE}:latest"
+# Tag the app image from local build to registry name
+docker tag "${LOCAL_APP_IMAGE}" "${APP_IMAGE}:${TAG}"
+docker tag "${LOCAL_APP_IMAGE}" "${APP_IMAGE}:latest"
 
 # [6/6] Export .tar.gz
 echo "=== [6/6] Exporting .tar.gz ==="
