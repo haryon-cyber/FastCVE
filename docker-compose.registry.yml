@@ -1,6 +1,6 @@
 services:
   fastcve-db:
-    image: "${FASTCVE_DB_IMAGE:-postgres:16-alpine3.19}"
+    image: "fastcve-db:latest"
     container_name: fastcve-db
     environment:
       - POSTGRES_USER=${FCDB_USER}
@@ -19,7 +19,7 @@ services:
           - fastcve-db
 
   fastcve:
-    image: "${FASTCVE_DOCKER_IMG}:${FASTCVE_DOCKER_TAG}"
+    image: "fastcve:latest"
     container_name: fastcve
     depends_on:
       fastcve-db:
