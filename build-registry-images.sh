@@ -76,9 +76,9 @@ if [ -n "${DUMP_PATH}" ] && [ -f "${DUMP_PATH}" ]; then
   docker compose -f "${COMPOSE_FILE}" up -d --no-deps fastcve
   sleep 5
 
-  # Incremental update (load handles schema init internally)
+  # Incremental update (cvehist excluded: not in dump's fetch_status, would pull full history)
   docker compose -f "${COMPOSE_FILE}" exec fastcve load \
-    --data cve cvehist cpe epss kev
+    --data cve cpe cwe capec epss kev
 else
   echo "=== [2/6] Loading all data from NVD (this may take hours) ==="
   docker compose -f "${COMPOSE_FILE}" up -d --no-deps fastcve
