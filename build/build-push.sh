@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# FastCVE Registry Images Builder
-# Produces fastcve-db and fastcve Docker images with pre-populated PostgreSQL data.
+# build-push.sh - ADMIN: build FastCVE images from source and push to the OVH registry.
+# Produces fastcve-db and fastcve images with pre-populated PostgreSQL data.
+# Run this on the build server (with registry credentials).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -1,9 +1,10 @@
 #!/bin/bash
+# load.sh - DEV: pull FastCVE images from the OVH registry.
+# Use this on developer machines that HAVE access to the registry.
+# After this script, run: docker compose -f docker-compose.registry.yml up -d
 set -e
 
 REGISTRY="3b008863.eu-west-par.container-registry.ovh.net/fastcve"
-
-echo "[+] Loading FastCVE images from registry..."
 
 echo "[+] Pulling fastcve-db..."
 docker pull "${REGISTRY}/fastcve-db:latest"
@@ -17,5 +18,4 @@ echo "[+] Images loaded:"
 docker images | grep -E "^fastcve"
 
 echo ""
-echo "[+] Starting FastCVE..."
-docker compose -f docker-compose.registry.yml up -d
+echo "[+] Now run: docker compose -f docker-compose.registry.yml up -d"
