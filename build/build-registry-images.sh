@@ -113,9 +113,28 @@ fi
 # [5/6] Build the pre-populated DB image
 echo "=== [5/6] Building DB image ==="
 
+cat > "${SNAPSHOT_DIR}/entrypoint.sh" << 'ENTRYPOINT'
+#!/bin/bash
+set -e
+
+if [ ! "$(ls -A /var/lib/postgresql/data 2>/dev/null)" ]; then
+    echo "[entrypoint] Volume empty, copying initial data..."
+    cp -a /var/lib/postgresql/initial-data/. /var/lib/postgresql/data/
+    chown -R postgres:postgres /var/lib/postgresql/data
+else
+    echo "[entrypoint] Volume has data, skipping copy."
+fi
+
+exec docker-entrypoint.sh "$@"
+ENTRYPOINT
+chmod +x "${SNAPSHOT_DIR}/entrypoint.sh"
+
 cat > "${SNAPSHOT_DIR}/Dockerfile" << 'DOCKERFILE'
 FROM postgres:16-alpine3.19
-COPY --chown=postgres:postgres pgdata/ /var/lib/postgresql/data/
+COPY --chown=postgres:postgres pgdata/ /var/lib/postgresql/initial-data/
+COPY entrypoint.sh /usr/local/bin/custom-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/custom-entrypoint.sh"]
+CMD ["postgres"]
 DOCKERFILE
 
 docker build \

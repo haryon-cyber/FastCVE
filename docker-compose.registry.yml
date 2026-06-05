@@ -6,6 +6,8 @@ services:
       - POSTGRES_USER=${FCDB_USER}
       - POSTGRES_PASSWORD=${FCDB_PASS}
       - POSTGRES_DB=vuln_db
+    volumes:
+      - fastcve_data:/var/lib/postgresql/data
     ports:
       - "127.0.0.1:6630:5432"
     healthcheck:
@@ -38,3 +40,6 @@ services:
 
 networks:
   backend:
+
+volumes:
+  fastcve_data:
