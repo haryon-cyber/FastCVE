@@ -53,30 +53,36 @@ echo ""
 
 mkdir -p "${OUTPUT_DIR}"
 
-# [1/6] Start stack with clean DB (purge old volume)
-echo "=== [1/6] Starting stack ==="
+# [1/6] Build app image, start only DB (app starts after dump restore)
+echo "=== [1/6] Setting up ==="
 docker compose -f "${COMPOSE_FILE}" down -v 2>/dev/null || true
-docker compose -f "${COMPOSE_FILE}" up -d --build
+docker compose -f "${COMPOSE_FILE}" build fastcve
+docker compose -f "${COMPOSE_FILE}" up -d fastcve-db
 
 echo "Waiting for DB..."
 docker compose -f "${COMPOSE_FILE}" exec fastcve-db sh -c \
   'until pg_isready -U "$POSTGRES_USER"; do sleep 2; done'
 
-# [2/6] Load data — either from dump + incremental, or full NVD load
+# [2/6] Restore dump or full load
 DUMP_PATH="${DUMP_PATH:-}"
 if [ -n "${DUMP_PATH}" ] && [ -f "${DUMP_PATH}" ]; then
   echo "=== [2/6] Restoring from dump: ${DUMP_PATH} ==="
   docker compose -f "${COMPOSE_FILE}" cp "${DUMP_PATH}" fastcve-db:/tmp/fastcve_vuln_db.dump
-  docker compose -f "${COMPOSE_FILE}" exec fastcve-db sh -c \
-    "PGPASSWORD=\"\$POSTGRES_PASSWORD\" pg_restore --clean --if-exists -U \"\$POSTGRES_USER\" -d vuln_db /tmp/fastcve_vuln_db.dump"
+  docker compose -f "${COMPOSE_FILE}" exec -T fastcve-db sh -c \
+    "PGPASSWORD=\"\$POSTGRES_PASSWORD\" pg_restore -U \"\$POSTGRES_USER\" -d vuln_db /tmp/fastcve_vuln_db.dump"
 
-  # Apply any schema migrations, then incremental update
-  docker compose -f "${COMPOSE_FILE}" exec fastcve python -m web.prestart
+  # Start app (prestart runs, creates/upgrades schema on top of restored data)
+  echo "Starting app..."
+  docker compose -f "${COMPOSE_FILE}" up -d --no-deps fastcve
+  sleep 5
+
+  # Incremental update (load handles schema init internally)
   docker compose -f "${COMPOSE_FILE}" exec fastcve load \
     --data cve cvehist cpe epss kev
 else
   echo "=== [2/6] Loading all data from NVD (this may take hours) ==="
-  docker compose -f "${COMPOSE_FILE}" exec fastcve python -m web.prestart
+  docker compose -f "${COMPOSE_FILE}" up -d --no-deps fastcve
+  sleep 5
   docker compose -f "${COMPOSE_FILE}" exec fastcve load \
     --data cve cvehist cpe cwe capec epss kev
 fi
