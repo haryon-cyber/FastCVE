@@ -17,7 +17,7 @@ services:
           - fastcve-db
 
   fastcve:
-    image: "${FASTCVE_DOCKER_IMG}:${FASTCVE_DOCKER_TAG}"
+    image: "${FASTCVE_DOCKER_IMG:-registry.example.com/fastcve}:${FASTCVE_DOCKER_TAG:-latest}"
     container_name: fastcve
     depends_on:
       fastcve-db:

@@ -8,14 +8,19 @@ cd "${SCRIPT_DIR}"
 
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/.env"
+# Load registry-specific overrides if present
+if [ -f "${SCRIPT_DIR}/.env.registry" ]; then
+  set -a; source "${SCRIPT_DIR}/.env.registry"; set +a
+fi
 
 SNAPSHOT_DIR=""
+COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
 
 cleanup() {
   if [ -n "${SNAPSHOT_DIR}" ]; then
     rm -rf "${SNAPSHOT_DIR}"
   fi
-  docker compose down -v 2>/dev/null || true
+  docker compose -f "${COMPOSE_FILE}" down --remove-orphans 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -35,41 +40,34 @@ mkdir -p "${OUTPUT_DIR}"
 
 # [1/6] Start stack with clean DB (purge old volume)
 echo "=== [1/6] Starting stack ==="
-docker compose down -v 2>/dev/null || true
-docker compose up -d --build
+docker compose -f "${COMPOSE_FILE}" down -v 2>/dev/null || true
+docker compose -f "${COMPOSE_FILE}" up -d --build
 
 echo "Waiting for DB..."
-docker compose exec fastcve-db sh -c \
+docker compose -f "${COMPOSE_FILE}" exec fastcve-db sh -c \
   'until pg_isready -U "$POSTGRES_USER"; do sleep 2; done'
 
 # [2/6] Load all data
 echo "=== [2/6] Loading data (this may take hours) ==="
-docker compose exec fastcve python -m web.prestart
-docker compose exec fastcve load \
+docker compose -f "${COMPOSE_FILE}" exec fastcve python -m web.prestart
+docker compose -f "${COMPOSE_FILE}" exec fastcve load \
   --data cve cvehist cpe cwe capec epss kev
 
 # [3/6] Stop DB cleanly (flush + checkpoint)
 echo "=== [3/6] Stopping DB cleanly ==="
-docker compose stop fastcve-db
+docker compose -f "${COMPOSE_FILE}" stop fastcve-db
 
 # [4/6] Snapshot PGDATA via the stopped container's volume
 echo "=== [4/6] Snapshotting PGDATA ==="
 SNAPSHOT_DIR="$(mktemp -d)"
-DB_CONTAINER="$(docker compose ps -aq fastcve-db)"
+DB_CONTAINER="$(docker compose -f "${COMPOSE_FILE}" ps -aq fastcve-db)"
 
 if [ -z "${DB_CONTAINER}" ]; then
   echo "ERROR: No fastcve-db container found (was it stopped and removed?)"
   exit 1
 fi
 
-docker run --rm \
-  --volumes-from "${DB_CONTAINER}" \
-  alpine \
-  tar czf - -C /var/lib/postgresql/data . \
-  > "${SNAPSHOT_DIR}/pgdata.tar.gz"
-
-mkdir -p "${SNAPSHOT_DIR}/pgdata"
-tar xzf "${SNAPSHOT_DIR}/pgdata.tar.gz" -C "${SNAPSHOT_DIR}/pgdata"
+docker cp "${DB_CONTAINER}:/var/lib/postgresql/data/." "${SNAPSHOT_DIR}/pgdata"
 # Remove stale PID file if any (can happen if container stopped forcefully)
 rm -f "${SNAPSHOT_DIR}/pgdata/postmaster.pid"
 
