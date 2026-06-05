@@ -6,6 +6,8 @@ services:
       - POSTGRES_USER=${FCDB_USER}
       - POSTGRES_PASSWORD=${FCDB_PASS}
       - POSTGRES_DB=vuln_db
+    ports:
+      - "127.0.0.1:6630:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
       interval: 5s
@@ -17,7 +19,7 @@ services:
           - fastcve-db
 
   fastcve:
-    image: "${FASTCVE_DOCKER_IMG:-registry.example.com/fastcve}:${FASTCVE_DOCKER_TAG:-latest}"
+    image: "${FASTCVE_DOCKER_IMG}:${FASTCVE_DOCKER_TAG}"
     container_name: fastcve
     depends_on:
       fastcve-db:
@@ -30,7 +32,7 @@ services:
       - NVD_API_KEY=${NVD_API_KEY}
     command: ["/bin/sh", "-c", "python -m web.prestart && exec uvicorn web.app:app $$FCDB_WEB_PARAMS"]
     ports:
-      - "8000:8000"
+      - "127.0.0.1:10210:8000"
     networks:
       - backend
 
