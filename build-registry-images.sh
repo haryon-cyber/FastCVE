@@ -9,7 +9,23 @@ cd "${SCRIPT_DIR}"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/.env"
 
-# Save the local build tag before any registry override
+# Save dev compose vars before any registry override
+DEV_DB_IMAGE="${FASTCVE_DB_IMAGE:-postgres:16-alpine3.19}"
+DEV_APP_IMAGE="${FASTCVE_DOCKER_IMG:-binare/fastcve}"
+DEV_APP_TAG="${FASTCVE_DOCKER_TAG:-latest}"
+
+# Load registry overrides early (for DUMP_PATH), but reset compose vars after
+DUMP_PATH=""
+if [ -f "${SCRIPT_DIR}/.env.registry" ]; then
+  set -a; source "${SCRIPT_DIR}/.env.registry"; set +a
+  DUMP_PATH="${DUMP_PATH:-}"
+fi
+
+# Reset compose vars to dev values (registry would make compose pull instead of build)
+FASTCVE_DB_IMAGE="${DEV_DB_IMAGE}"
+FASTCVE_DOCKER_IMG="${DEV_APP_IMAGE}"
+FASTCVE_DOCKER_TAG="${DEV_APP_TAG}"
+
 LOCAL_APP_IMAGE="${FASTCVE_DOCKER_IMG}:${FASTCVE_DOCKER_TAG}"
 
 SNAPSHOT_DIR=""
