@@ -46,11 +46,24 @@ echo "Waiting for DB..."
 docker compose -f "${COMPOSE_FILE}" exec fastcve-db sh -c \
   'until pg_isready -U "$POSTGRES_USER"; do sleep 2; done'
 
-# [2/6] Load all data
-echo "=== [2/6] Loading data (this may take hours) ==="
-docker compose -f "${COMPOSE_FILE}" exec fastcve python -m web.prestart
-docker compose -f "${COMPOSE_FILE}" exec fastcve load \
-  --data cve cvehist cpe cwe capec epss kev
+# [2/6] Load data — either from dump + incremental, or full NVD load
+DUMP_PATH="${DUMP_PATH:-}"
+if [ -n "${DUMP_PATH}" ] && [ -f "${DUMP_PATH}" ]; then
+  echo "=== [2/6] Restoring from dump: ${DUMP_PATH} ==="
+  docker compose -f "${COMPOSE_FILE}" cp "${DUMP_PATH}" fastcve-db:/tmp/fastcve_vuln_db.dump
+  docker compose -f "${COMPOSE_FILE}" exec fastcve-db sh -c \
+    "pg_restore -U \"\$POSTGRES_USER\" -d vuln_db --clean --if-exists /tmp/fastcve_vuln_db.dump"
+
+  # Apply any schema migrations, then incremental update
+  docker compose -f "${COMPOSE_FILE}" exec fastcve python -m web.prestart
+  docker compose -f "${COMPOSE_FILE}" exec fastcve load \
+    --data cve cvehist cpe epss kev
+else
+  echo "=== [2/6] Loading all data from NVD (this may take hours) ==="
+  docker compose -f "${COMPOSE_FILE}" exec fastcve python -m web.prestart
+  docker compose -f "${COMPOSE_FILE}" exec fastcve load \
+    --data cve cvehist cpe cwe capec epss kev
+fi
 
 # [3/6] Stop DB cleanly (flush + checkpoint)
 echo "=== [3/6] Stopping DB cleanly ==="
@@ -103,8 +116,8 @@ echo "=== Done ==="
 echo "  ${OUTPUT_DIR}/fastcve-db-${TAG}.tar.gz"
 echo "  ${OUTPUT_DIR}/fastcve-app-${TAG}.tar.gz"
 
-# Optional push
-if [ "${PUSH:-false}" = "true" ]; then
+# Push to registry
+if [ "${PUSH:-true}" = "true" ]; then
   echo "=== Pushing ==="
   docker push "${DB_IMAGE}:${TAG}" && docker push "${DB_IMAGE}:latest"
   docker push "${APP_IMAGE}:${TAG}" && docker push "${APP_IMAGE}:latest"
