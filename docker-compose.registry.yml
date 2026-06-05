@@ -1,0 +1,37 @@
+services:
+  fastcve-db:
+    image: "${FASTCVE_DB_IMAGE:-postgres:16-alpine3.19}"
+    container_name: fastcve-db
+    environment:
+      - POSTGRES_USER=${FCDB_USER}
+      - POSTGRES_PASSWORD=${FCDB_PASS}
+      - POSTGRES_DB=vuln_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      backend:
+        aliases:
+          - fastcve-db
+
+  fastcve:
+    image: "${FASTCVE_DOCKER_IMG}:${FASTCVE_DOCKER_TAG}"
+    container_name: fastcve
+    depends_on:
+      fastcve-db:
+        condition: service_healthy
+    environment:
+      - INP_ENV_NAME=${INP_ENV_NAME:-dev}
+      - FCDB_USER=${FCDB_USER}
+      - FCDB_PASS=${FCDB_PASS}
+      - NVD_API_KEY=${NVD_API_KEY}
+    command: ["/bin/sh", "-c", "python -m web.prestart && exec uvicorn web.app:app --host 0.0.0.0 --port 8000 --workers 4"]
+    ports:
+      - "8000:8000"
+    networks:
+      - backend
+
+networks:
+  backend:
