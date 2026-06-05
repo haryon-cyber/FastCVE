@@ -68,7 +68,7 @@ if [ -n "${DUMP_PATH}" ] && [ -f "${DUMP_PATH}" ]; then
   echo "=== [2/6] Restoring from dump: ${DUMP_PATH} ==="
   docker compose -f "${COMPOSE_FILE}" cp "${DUMP_PATH}" fastcve-db:/tmp/fastcve_vuln_db.dump
   docker compose -f "${COMPOSE_FILE}" exec fastcve-db sh -c \
-    "PGPASSWORD=\"\$POSTGRES_PASSWORD\" pg_restore -U \"\$POSTGRES_USER\" -d vuln_db /tmp/fastcve_vuln_db.dump"
+    "PGPASSWORD=\"\$POSTGRES_PASSWORD\" pg_restore --clean --if-exists -U \"\$POSTGRES_USER\" -d vuln_db /tmp/fastcve_vuln_db.dump"
 
   # Apply any schema migrations, then incremental update
   docker compose -f "${COMPOSE_FILE}" exec fastcve python -m web.prestart
