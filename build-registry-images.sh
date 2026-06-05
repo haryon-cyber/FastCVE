@@ -53,7 +53,8 @@ docker run --rm \
   tar czf - -C /var/lib/postgresql/data . \
   > "${SNAPSHOT_DIR}/pgdata.tar.gz"
 
-tar xzf "${SNAPSHOT_DIR}/pgdata.tar.gz" -C "${SNAPSHOT_DIR}"
+mkdir -p "${SNAPSHOT_DIR}/pgdata"
+tar xzf "${SNAPSHOT_DIR}/pgdata.tar.gz" -C "${SNAPSHOT_DIR}/pgdata"
 
 # [5/6] Build the pre-populated DB image
 echo "=== [5/6] Building DB image ==="
