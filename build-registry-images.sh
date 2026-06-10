@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # FastCVE Registry Images Builder
 # Produces fastcve-db and fastcve Docker images with pre-populated PostgreSQL data.
+#
+# Strategy: pull the previous registry images (DB already has data), start the
+# stack, run an incremental data update, snapshot the updated DB, rebuild the
+# app image from source, then push everything.  This avoids a full NVD reload:
+# each run only fetches what changed since the last build.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -36,6 +41,7 @@ cleanup() {
     rm -rf "${SNAPSHOT_DIR}"
   fi
   docker compose -f "${COMPOSE_FILE}" down --remove-orphans 2>/dev/null || true
+  docker compose -f "${REGISTRY_COMPOSE}" down --remove-orphans 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -45,6 +51,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./dist}"
 
 DB_IMAGE="${REGISTRY}-db"
 APP_IMAGE="${REGISTRY}"
+REGISTRY_COMPOSE="docker-compose.registry.yml"
 
 echo "=== Registry Images Builder ==="
 echo "  Registry: ${REGISTRY}"
@@ -53,62 +60,67 @@ echo ""
 
 mkdir -p "${OUTPUT_DIR}"
 
-# [0/6] Pull previous registry image as Docker cache source
-# This lets Docker reuse layers from the last push, avoiding full rebuilds.
-echo "=== [0/6] Pulling cache image from registry ==="
-if docker pull "${REGISTRY}:latest" 2>/dev/null; then
-  docker tag "${REGISTRY}:latest" "${LOCAL_APP_IMAGE}" 2>/dev/null || true
-  echo "  Cached from registry: ${REGISTRY}:latest"
-else
-  echo "  No existing registry image found, building from scratch"
-fi
-
-# Enable Docker BuildKit for more efficient layer caching
+# Enable Docker BuildKit for efficient layer caching
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
-# [1/6] Build app image, start only DB (app starts after dump restore)
-echo "=== [1/6] Setting up ==="
-docker compose -f "${COMPOSE_FILE}" down -v 2>/dev/null || true
-docker compose -f "${COMPOSE_FILE}" build fastcve
-docker compose -f "${COMPOSE_FILE}" up -d fastcve-db
+# ---------------------------------------------------------------------------
+# [0/7] Pull previous registry images (app cache + pre-populated DB data)
+# ---------------------------------------------------------------------------
+echo "=== [0/7] Pulling registry images ==="
+docker pull "${REGISTRY}:latest" 2>/dev/null && \
+  docker tag "${REGISTRY}:latest" "fastcve:latest" 2>/dev/null || true
+docker pull "${REGISTRY}-db:latest" 2>/dev/null && \
+  docker tag "${REGISTRY}-db:latest" "fastcve-db:latest" 2>/dev/null || true
+echo "  Done"
+
+# ---------------------------------------------------------------------------
+# [1/7] Start the stack from the pulled images
+# ---------------------------------------------------------------------------
+echo "=== [1/7] Starting stack from registry images ==="
+docker compose -f "${REGISTRY_COMPOSE}" down --remove-orphans 2>/dev/null || true
+docker compose -f "${REGISTRY_COMPOSE}" up -d fastcve-db
 
 echo "Waiting for DB..."
-docker compose -f "${COMPOSE_FILE}" exec fastcve-db sh -c \
+docker compose -f "${REGISTRY_COMPOSE}" exec fastcve-db sh -c \
   'until pg_isready -U "$POSTGRES_USER"; do sleep 2; done'
 
-# [2/6] Restore dump or full load
-DUMP_PATH="${DUMP_PATH:-}"
-if [ -n "${DUMP_PATH}" ] && [ -f "${DUMP_PATH}" ]; then
-  echo "=== [2/6] Restoring from dump: ${DUMP_PATH} ==="
-  docker compose -f "${COMPOSE_FILE}" cp "${DUMP_PATH}" fastcve-db:/tmp/fastcve_vuln_db.dump
-  docker compose -f "${COMPOSE_FILE}" exec -T fastcve-db sh -c \
-    "PGPASSWORD=\"\$POSTGRES_PASSWORD\" pg_restore -U \"\$POSTGRES_USER\" -d vuln_db /tmp/fastcve_vuln_db.dump"
+# Start app (prestart runs schema upgrades on existing data)
+docker compose -f "${REGISTRY_COMPOSE}" up -d --no-deps fastcve
+sleep 5
 
-  # Start app (prestart runs, creates/upgrades schema on top of restored data)
-  echo "Starting app..."
-  docker compose -f "${COMPOSE_FILE}" up -d --no-deps fastcve
-  sleep 5
+# ---------------------------------------------------------------------------
+# [2/7] Incremental (or full) data update
+# ---------------------------------------------------------------------------
+# Check whether vuln_db already has data (from pulled image or previous volume)
+HAS_DATA=false
+if docker compose -f "${REGISTRY_COMPOSE}" exec -T fastcve-db \
+    sh -c 'psql -U "$POSTGRES_USER" -d vuln_db -c "SELECT 1 FROM cve LIMIT 1" 2>/dev/null' &>/dev/null; then
+  HAS_DATA=true
+fi
 
-  # Incremental update (cvehist excluded: not in dump's fetch_status, would pull full history)
-  docker compose -f "${COMPOSE_FILE}" exec fastcve load \
+if [ "$HAS_DATA" = true ]; then
+  echo "=== [2/7] Incremental data update ==="
+  docker compose -f "${REGISTRY_COMPOSE}" exec fastcve load \
     --data cve cpe cwe capec epss kev
 else
-  echo "=== [2/6] Loading all data from NVD (this may take hours) ==="
-  docker compose -f "${COMPOSE_FILE}" up -d --no-deps fastcve
-  sleep 5
-  docker compose -f "${COMPOSE_FILE}" exec fastcve load \
+  echo "=== [2/7] Loading all data from NVD (first run, this may take hours) ==="
+  docker compose -f "${REGISTRY_COMPOSE}" exec fastcve load \
     --data cve cvehist cpe cwe capec epss kev
 fi
 
-# [3/6] Stop DB cleanly (flush + checkpoint)
-echo "=== [3/6] Stopping DB cleanly ==="
-docker compose -f "${COMPOSE_FILE}" stop fastcve-db
+# ---------------------------------------------------------------------------
+# [3/7] Stop DB cleanly (flush + checkpoint)
+# ---------------------------------------------------------------------------
+echo "=== [3/7] Stopping DB cleanly ==="
+docker compose -f "${REGISTRY_COMPOSE}" stop fastcve-db
 
-# [4/6] Snapshot PGDATA via the stopped container's volume
-echo "=== [4/6] Snapshotting PGDATA ==="
+# ---------------------------------------------------------------------------
+# [4/7] Snapshot PGDATA via the stopped container's volume
+# ---------------------------------------------------------------------------
+echo "=== [4/7] Snapshotting PGDATA ==="
 SNAPSHOT_DIR="$(mktemp -d)"
-DB_CONTAINER="$(docker compose -f "${COMPOSE_FILE}" ps -aq fastcve-db)"
+DB_CONTAINER="$(docker compose -f "${REGISTRY_COMPOSE}" ps -aq fastcve-db)"
 
 if [ -z "${DB_CONTAINER}" ]; then
   echo "ERROR: No fastcve-db container found (was it stopped and removed?)"
@@ -119,13 +131,26 @@ docker cp "${DB_CONTAINER}:/var/lib/postgresql/data/." "${SNAPSHOT_DIR}/pgdata"
 # Remove stale PID file if any (can happen if container stopped forcefully)
 rm -f "${SNAPSHOT_DIR}/pgdata/postmaster.pid"
 
+# Tear down the registry compose stack (volume preserved for next incremental run)
+docker compose -f "${REGISTRY_COMPOSE}" down --remove-orphans 2>/dev/null || true
+
 # Now load registry overrides for tagging (after compose steps are done)
 if [ -f "${SCRIPT_DIR}/.env.registry" ]; then
   set -a; source "${SCRIPT_DIR}/.env.registry"; set +a
 fi
 
-# [5/6] Build the pre-populated DB image
-echo "=== [5/6] Building DB image ==="
+# ---------------------------------------------------------------------------
+# [5/7] Build fresh app image from source (layers cached via BuildKit)
+# ---------------------------------------------------------------------------
+echo "=== [5/7] Building app image ==="
+docker compose -f "${COMPOSE_FILE}" build fastcve
+docker tag "${LOCAL_APP_IMAGE}" "${APP_IMAGE}:${TAG}"
+docker tag "${LOCAL_APP_IMAGE}" "${APP_IMAGE}:latest"
+
+# ---------------------------------------------------------------------------
+# [6/7] Build fresh DB image with updated snapshot
+# ---------------------------------------------------------------------------
+echo "=== [6/7] Building DB image ==="
 
 cat > "${SNAPSHOT_DIR}/Dockerfile" << 'DOCKERFILE'
 FROM postgres:16-alpine3.19
@@ -138,12 +163,10 @@ docker build \
   -f "${SNAPSHOT_DIR}/Dockerfile" \
   "${SNAPSHOT_DIR}"
 
-# Tag the app image from local build to registry name
-docker tag "${LOCAL_APP_IMAGE}" "${APP_IMAGE}:${TAG}"
-docker tag "${LOCAL_APP_IMAGE}" "${APP_IMAGE}:latest"
-
-# [6/6] Export .tar.gz
-echo "=== [6/6] Exporting .tar.gz ==="
+# ---------------------------------------------------------------------------
+# [7/7] Export .tar.gz
+# ---------------------------------------------------------------------------
+echo "=== [7/7] Exporting .tar.gz ==="
 docker save "${DB_IMAGE}:${TAG}" | gzip > "${OUTPUT_DIR}/fastcve-db-${TAG}.tar.gz"
 docker save "${APP_IMAGE}:${TAG}" | gzip > "${OUTPUT_DIR}/fastcve-app-${TAG}.tar.gz"
 
