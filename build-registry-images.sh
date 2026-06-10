@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# build-push.sh - ADMIN: build FastCVE images from source and push to the OVH registry.
-# Produces fastcve-db and fastcve images with pre-populated PostgreSQL data.
-# Run this on the build server (with registry credentials).
+# FastCVE Registry Images Builder
+# Produces fastcve-db and fastcve Docker images with pre-populated PostgreSQL data.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -55,6 +54,7 @@ echo ""
 mkdir -p "${OUTPUT_DIR}"
 
 # [0/6] Pull previous registry image as Docker cache source
+# This lets Docker reuse layers from the last push, avoiding full rebuilds.
 echo "=== [0/6] Pulling cache image from registry ==="
 if docker pull "${REGISTRY}:latest" 2>/dev/null; then
   docker tag "${REGISTRY}:latest" "${LOCAL_APP_IMAGE}" 2>/dev/null || true
@@ -63,6 +63,7 @@ else
   echo "  No existing registry image found, building from scratch"
 fi
 
+# Enable Docker BuildKit for more efficient layer caching
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
@@ -126,28 +127,9 @@ fi
 # [5/6] Build the pre-populated DB image
 echo "=== [5/6] Building DB image ==="
 
-cat > "${SNAPSHOT_DIR}/entrypoint.sh" << 'ENTRYPOINT'
-#!/bin/bash
-set -e
-
-if [ ! "$(ls -A /var/lib/postgresql/data 2>/dev/null)" ]; then
-    echo "[entrypoint] Volume empty, copying initial data..."
-    cp -a /var/lib/postgresql/initial-data/. /var/lib/postgresql/data/
-    chown -R postgres:postgres /var/lib/postgresql/data
-else
-    echo "[entrypoint] Volume has data, skipping copy."
-fi
-
-exec docker-entrypoint.sh "$@"
-ENTRYPOINT
-chmod +x "${SNAPSHOT_DIR}/entrypoint.sh"
-
 cat > "${SNAPSHOT_DIR}/Dockerfile" << 'DOCKERFILE'
 FROM postgres:16-alpine3.19
-COPY --chown=postgres:postgres pgdata/ /var/lib/postgresql/initial-data/
-COPY entrypoint.sh /usr/local/bin/custom-entrypoint.sh
-ENTRYPOINT ["/usr/local/bin/custom-entrypoint.sh"]
-CMD ["postgres"]
+COPY --chown=postgres:postgres pgdata/ /var/lib/postgresql/data/
 DOCKERFILE
 
 docker build \
